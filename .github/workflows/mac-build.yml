@@ -1,0 +1,79 @@
+name: Personal macOS build
+
+# Fork-only: builds an ad-hoc signed Apple Silicon app for personal use.
+# There is no Apple Developer ID, so Gatekeeper asks once on first launch.
+
+on:
+  push:
+    branches: [mac-build]
+  workflow_dispatch:
+    inputs:
+      ref:
+        description: Branch, tag, or SHA to build
+        default: multi-repo-workspaces
+        type: string
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    runs-on: macos-15
+    timeout-minutes: 60
+    steps:
+      - name: Checkout
+        shell: bash
+        env:
+          CHECKOUT_REF: ${{ inputs.ref || github.sha }}
+        run: |
+          set -euo pipefail
+          git init .
+          git remote add origin "${GITHUB_SERVER_URL}/${GITHUB_REPOSITORY}.git"
+          git fetch --no-tags --depth=1 origin "$CHECKOUT_REF"
+          git sparse-checkout set --no-cone '/*' '!/.repos/'
+          git checkout --detach FETCH_HEAD
+          echo "SHORT_SHA=$(git rev-parse --short=7 HEAD)" >> "$GITHUB_ENV"
+
+      - name: Setup Vite+
+        uses: voidzero-dev/setup-vp@250f29ce396baf5e8f24498e17c0dfdebabc26eb # v1
+        with:
+          node-version-file: package.json
+          cache: true
+          run-install: false
+
+      - name: Install dependencies
+        run: vp install
+
+      - name: Setup Rust
+        uses: dtolnay/rust-toolchain@6bed0761d98439e5a578e2877258200ad565ba87 # stable
+        with:
+          toolchain: stable
+          targets: aarch64-apple-darwin
+
+      - name: Build app
+        env:
+          CSC_IDENTITY_AUTO_DISCOVERY: "false"
+          T3CODE_DESKTOP_VERSION: 0.0.43-nightly.20260929.2428+multirepo.${{ env.SHORT_SHA }}
+        run: node scripts/build-desktop-artifact.ts --platform mac --target zip --arch arm64
+
+      # Electron's own signature breaks once the bundle is customized, and an
+      # arm64 Mac refuses to run unsigned code, so sign the whole bundle ad hoc.
+      - name: Ad-hoc sign and repackage
+        shell: bash
+        run: |
+          set -euo pipefail
+          zip_path="$(ls release/*.zip | head -n1)"
+          mkdir -p "$RUNNER_TEMP/app" out
+          ditto -x -k "$zip_path" "$RUNNER_TEMP/app"
+          app_path="$(ls -d "$RUNNER_TEMP"/app/*.app | head -n1)"
+          codesign --force --deep --sign - "$app_path"
+          codesign --verify --deep --strict --verbose=2 "$app_path"
+          ditto -c -k --sequesterRsrc --keepParent "$app_path" "out/T3-Code-${SHORT_SHA}-arm64-mac.zip"
+
+      - name: Upload
+        uses: actions/upload-artifact@v4
+        with:
+          name: T3-Code-${{ env.SHORT_SHA }}-arm64-mac
+          path: out/*.zip
+          compression-level: 0
+          retention-days: 14
