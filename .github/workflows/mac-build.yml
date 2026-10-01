@@ -76,12 +76,12 @@ jobs:
           app_path="$(ls -d "$RUNNER_TEMP"/app/*.app | head -n1)"
           codesign --force --deep --sign - "$app_path"
           codesign --verify --deep --strict --verbose=2 "$app_path"
-          ditto -c -k --sequesterRsrc --keepParent "$app_path" "out/T3-Code-${SHORT_SHA}-arm64-mac.zip"
+          ditto -c -k --sequesterRsrc --keepParent "$app_path" "out/T3-Code-${T3CODE_DESKTOP_VERSION}-arm64-mac.zip"
 
       - name: Upload
         uses: actions/upload-artifact@v4
         with:
-          name: T3-Code-${{ env.SHORT_SHA }}-arm64-mac
+          name: T3-Code-${{ env.T3CODE_DESKTOP_VERSION }}-arm64-mac
           path: out/*.zip
           compression-level: 0
           retention-days: 14
