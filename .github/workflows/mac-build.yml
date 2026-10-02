@@ -43,6 +43,19 @@ jobs:
           echo "SHORT_SHA=$short_sha" >> "$GITHUB_ENV"
           echo "T3CODE_DESKTOP_VERSION=$VERSION" >> "$GITHUB_ENV"
 
+      # SSH remotes download t3-<app version> from upstream releases, and the
+      # "+multirepo.<sha>" build metadata names no release. Strip it for that
+      # lookup so remotes run the upstream nightly this build is based on.
+      - name: Point SSH remotes at the upstream release
+        shell: bash
+        run: |
+          set -euo pipefail
+          runner=apps/desktop/src/main.ts
+          grep -q 'return { archiveVersion: environment.appVersion };' "$runner" ||
+            { echo "SSH runner line changed upstream; update this patch" >&2; exit 1; }
+          sed -i '' 's|return { archiveVersion: environment.appVersion };|return { archiveVersion: environment.appVersion.replace(/\\+.*$/u, "") };|' "$runner"
+          grep -n 'archiveVersion: environment.appVersion' "$runner"
+
       - name: Setup Vite+
         uses: voidzero-dev/setup-vp@250f29ce396baf5e8f24498e17c0dfdebabc26eb # v1
         with:
