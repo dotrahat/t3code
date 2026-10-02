@@ -1,7 +1,15 @@
 name: Personal macOS build
 
-# Fork-only: builds an ad-hoc signed Apple Silicon app for personal use.
-# There is no Apple Developer ID, so Gatekeeper asks once on first launch.
+# Fork-only: builds an Apple Silicon app for personal use and publishes it as
+# an update on this fork's releases, so an installed build updates itself from
+# T3 Code's own Update button.
+#
+# There is no Apple Developer ID. The app is signed with a self-signed
+# certificate (secrets MAC_SIGN_P12 and MAC_SIGN_P12_PASSWORD; the original is
+# in ~/.config/t3-build/mac-signing on the build machine). macOS only installs
+# an update signed by the same identity as the running app, so every build has
+# to use this one certificate. Gatekeeper still asks on the first manual
+# install; updates installed by the app do not.
 
 # Started by the t3-build script with the exact commit and version to build.
 on:
@@ -12,12 +20,12 @@ on:
         default: multi-repo-workspaces
         type: string
       version:
-        description: App version (t3-build passes <base>.multirepo-<sha>)
+        description: App version (t3-build passes <base>.<commit time>.<label>-<sha>)
         required: false
         type: string
 
 permissions:
-  contents: read
+  contents: write
 
 jobs:
   build:
@@ -36,11 +44,12 @@ jobs:
           git fetch --no-tags --depth=1 origin "$CHECKOUT_REF"
           git sparse-checkout set --no-cone '/*' '!/.repos/'
           git checkout --detach FETCH_HEAD
-          short_sha="$(git rev-parse --short=7 HEAD)"
+          short_sha="$(git rev-parse --short=9 HEAD)"
           if [[ -z "$VERSION" ]]; then
-            VERSION="$(node -p "require('./apps/desktop/package.json').version").multirepo-$short_sha"
+            stamp="$(TZ=UTC git log -1 --format=%cd --date=format-local:%Y%m%d%H%M%S HEAD)"
+            VERSION="$(node -p "require('./apps/desktop/package.json').version").$stamp.multirepo-$short_sha"
           fi
-          echo "SHORT_SHA=$short_sha" >> "$GITHUB_ENV"
+          echo "BUILD_SHA=$(git rev-parse HEAD)" >> "$GITHUB_ENV"
           echo "T3CODE_DESKTOP_VERSION=$VERSION" >> "$GITHUB_ENV"
 
       # SSH remotes download t3-<app version> from upstream releases by default.
@@ -72,16 +81,38 @@ jobs:
           toolchain: stable
           targets: aarch64-apple-darwin
 
+      # The update feed is this fork's releases. The version has no -nightly
+      # suffix, so the app follows the "latest" channel: the release marked
+      # Latest on this fork.
       - name: Build app
         env:
           CSC_IDENTITY_AUTO_DISCOVERY: "false"
-        # Like t3-build-fork: no update feed, so the app never offers an
-        # upstream or fork release in place of this build.
-        run: env -u GITHUB_REPOSITORY -u T3CODE_DESKTOP_UPDATE_REPOSITORY node scripts/build-desktop-artifact.ts --platform mac --target zip --arch arm64
+        run: env -u GITHUB_REPOSITORY T3CODE_DESKTOP_UPDATE_REPOSITORY="$GITHUB_REPOSITORY" node scripts/build-desktop-artifact.ts --platform mac --target zip --arch arm64
 
-      # Electron's own signature breaks once the bundle is customized, and an
-      # arm64 Mac refuses to run unsigned code, so sign the whole bundle ad hoc.
-      - name: Ad-hoc sign and repackage
+      - name: Import signing certificate
+        shell: bash
+        env:
+          MAC_SIGN_P12: ${{ secrets.MAC_SIGN_P12 }}
+          MAC_SIGN_P12_PASSWORD: ${{ secrets.MAC_SIGN_P12_PASSWORD }}
+        run: |
+          set -euo pipefail
+          keychain="$RUNNER_TEMP/signing.keychain-db"
+          keychain_password="$(openssl rand -hex 16)"
+          printf '%s' "$MAC_SIGN_P12" | base64 --decode > "$RUNNER_TEMP/signing.p12"
+          security create-keychain -p "$keychain_password" "$keychain"
+          security set-keychain-settings -lut 3600 "$keychain"
+          security unlock-keychain -p "$keychain_password" "$keychain"
+          security import "$RUNNER_TEMP/signing.p12" -k "$keychain" -P "$MAC_SIGN_P12_PASSWORD" -T /usr/bin/codesign
+          security set-key-partition-list -S apple-tool:,apple: -s -k "$keychain_password" "$keychain" >/dev/null
+          security list-keychains -d user -s "$keychain" $(security list-keychains -d user | tr -d '"')
+          rm "$RUNNER_TEMP/signing.p12"
+          identity="$(security find-identity -p codesigning "$keychain" | awk '/T3 Code Fork Self-Signed/ { print $2; exit }')"
+          [[ -n "$identity" ]] || { security find-identity -p codesigning "$keychain"; echo "signing identity not found" >&2; exit 1; }
+          echo "SIGN_IDENTITY=$identity" >> "$GITHUB_ENV"
+
+      # Electron's own signature breaks once the bundle is customized, so sign
+      # the whole bundle with the fork's certificate.
+      - name: Sign and repackage
         shell: bash
         run: |
           set -euo pipefail
@@ -89,9 +120,31 @@ jobs:
           mkdir -p "$RUNNER_TEMP/app" out
           ditto -x -k "$zip_path" "$RUNNER_TEMP/app"
           app_path="$(ls -d "$RUNNER_TEMP"/app/*.app | head -n1)"
-          codesign --force --deep --sign - "$app_path"
+          [[ -f "$app_path/Contents/Resources/app-update.yml" ]] || { echo "build has no update feed" >&2; exit 1; }
+          cat "$app_path/Contents/Resources/app-update.yml"
+          codesign --force --deep --timestamp=none --sign "$SIGN_IDENTITY" "$app_path"
           codesign --verify --deep --strict --verbose=2 "$app_path"
-          ditto -c -k --sequesterRsrc --keepParent "$app_path" "out/T3-Code-${T3CODE_DESKTOP_VERSION}-arm64-mac.zip"
+          # The updater checks the new build against this requirement, which
+          # names the certificate, not the build.
+          requirement="$(codesign -d -r- "$app_path" 2>&1)"
+          echo "$requirement"
+          [[ $requirement == *"certificate leaf"* ]] ||
+            { echo "designated requirement does not pin the certificate" >&2; exit 1; }
+          zip_name="T3-Code-${T3CODE_DESKTOP_VERSION}-arm64-mac.zip"
+          ditto -c -k --sequesterRsrc --keepParent "$app_path" "out/$zip_name"
+          sha512="$(openssl dgst -sha512 -binary "out/$zip_name" | base64)"
+          size="$(stat -f%z "out/$zip_name")"
+          cat > out/latest-mac.yml <<EOF
+          version: ${T3CODE_DESKTOP_VERSION}
+          files:
+            - url: ${zip_name}
+              sha512: ${sha512}
+              size: ${size}
+          path: ${zip_name}
+          sha512: ${sha512}
+          releaseDate: '$(date -u +%Y-%m-%dT%H:%M:%S.000Z)'
+          EOF
+          cat out/latest-mac.yml
 
       - name: Upload
         uses: actions/upload-artifact@v4
@@ -100,3 +153,23 @@ jobs:
           path: out/*.zip
           compression-level: 0
           retention-days: 14
+
+      # The Linux build publishes the same release with the server archive for
+      # SSH remotes; whichever finishes first creates it. Marking it Latest is
+      # what makes installed apps offer it as an update.
+      - name: Publish update
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          tag="v${T3CODE_DESKTOP_VERSION}"
+          if ! gh release view "$tag" -R "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
+            gh release create "$tag" -R "$GITHUB_REPOSITORY" --target "$BUILD_SHA" --latest=false \
+              --title "T3 Code ${T3CODE_DESKTOP_VERSION}" \
+              --notes "Fork build at ${BUILD_SHA}." ||
+              gh release view "$tag" -R "$GITHUB_REPOSITORY" >/dev/null
+          fi
+          gh release upload "$tag" -R "$GITHUB_REPOSITORY" --clobber out/*.zip out/latest-mac.yml
+          gh release edit "$tag" -R "$GITHUB_REPOSITORY" --prerelease=false --latest
+          echo "published $tag as Latest"
