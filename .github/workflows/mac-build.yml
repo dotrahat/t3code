@@ -12,7 +12,7 @@ on:
         default: multi-repo-workspaces
         type: string
       version:
-        description: App version (defaults to <desktop package version>+multirepo.<sha>)
+        description: App version (t3-build passes <base>.multirepo-<sha>)
         required: false
         type: string
 
@@ -38,22 +38,22 @@ jobs:
           git checkout --detach FETCH_HEAD
           short_sha="$(git rev-parse --short=7 HEAD)"
           if [[ -z "$VERSION" ]]; then
-            VERSION="$(node -p "require('./apps/desktop/package.json').version")+multirepo.$short_sha"
+            VERSION="$(node -p "require('./apps/desktop/package.json').version").multirepo-$short_sha"
           fi
           echo "SHORT_SHA=$short_sha" >> "$GITHUB_ENV"
           echo "T3CODE_DESKTOP_VERSION=$VERSION" >> "$GITHUB_ENV"
 
-      # SSH remotes download t3-<app version> from upstream releases, and the
-      # "+multirepo.<sha>" build metadata names no release. Strip it for that
-      # lookup so remotes run the upstream nightly this build is based on.
-      - name: Point SSH remotes at the upstream release
+      # SSH remotes download t3-<app version> from upstream releases by default.
+      # t3-build publishes this build's server on the fork's releases; point
+      # remotes there so they run the same fork build as this app.
+      - name: Point SSH remotes at the fork's releases
         shell: bash
         run: |
           set -euo pipefail
           runner=apps/desktop/src/main.ts
           grep -q 'return { archiveVersion: environment.appVersion };' "$runner" ||
             { echo "SSH runner line changed upstream; update this patch" >&2; exit 1; }
-          sed -i '' 's|return { archiveVersion: environment.appVersion };|return { archiveVersion: environment.appVersion.replace(/\\+.*$/u, "") };|' "$runner"
+          sed -i '' "s|return { archiveVersion: environment.appVersion };|return { archiveVersion: environment.appVersion, releaseBaseUrl: \"https://github.com/${GITHUB_REPOSITORY}/releases/download\" };|" "$runner"
           grep -n 'archiveVersion: environment.appVersion' "$runner"
 
       - name: Setup Vite+
