@@ -85,10 +85,12 @@ export function createFileTreeDragMentionController(
           return mentionPath === null ? null : composerMentionFromTreePath(mentionPath);
         })
         .filter((mention): mention is string => mention !== null);
+      // The tree selects the dragged rows either way, so they need deselecting
+      // when the drag ends even if none of them can be mentioned.
+      draggedPaths = dragged;
       if (mentions.length === 0) {
         return;
       }
-      draggedPaths = dragged;
       event.dataTransfer.setData(COMPOSER_MENTION_DRAG_TYPE, mentions.join(" "));
     },
     handleDragEnd() {

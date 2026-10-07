@@ -43,9 +43,10 @@ describe("createFileTreeDragMentionController", () => {
     );
   });
 
-  it("leaves out rows the host resolves to no real path", () => {
+  it("leaves out rows the host resolves to no real path, but still deselects them", () => {
+    const deselected: Array<string> = [];
     const controller = createFileTreeDragMentionController({
-      deselect: () => {},
+      deselect: (path) => deselected.push(path),
       mentionPath: (treePath) => (treePath === "dupe-a" ? null : `/dev/${treePath}`),
     });
     const transfer = makeTransfer();
@@ -54,7 +55,8 @@ describe("createFileTreeDragMentionController", () => {
       composedPath: () => [rowNode("dupe-a/")],
     });
     expect(transfer.data.has(COMPOSER_MENTION_DRAG_TYPE)).toBe(false);
-    expect(controller.isDragInProgress()).toBe(false);
+    controller.handleDragEnd();
+    expect(deselected).toEqual(["dupe-a/"]);
   });
 
   it("strips the trailing slash from directory rows", () => {
